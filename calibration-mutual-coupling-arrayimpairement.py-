@@ -1,0 +1,157 @@
+import numpy as np
+import dash
+from dash import dcc, html
+from dash.dependencies import Input, Output
+import plotly.graph_objects as go
+
+# ===============================
+# Simulation Parameters
+# ===============================
+Nx, Ny = 16, 16
+dx, dy = 0.5, 0.5
+num_users = 4
+theta_scan = np.linspace(-90,90,91)
+phi_scan = np.linspace(-90,90,91)
+SNR_dB = 20
+time_steps = 30
+
+# ===============================
+# Helper Functions
+# ===============================
+def steering_vector_3d(theta_deg, phi_deg, Nx, Ny, dx, dy):
+    theta = np.deg2rad(theta_deg)
+    phi = np.deg2rad(phi_deg)
+    k = 2*np.pi
+    nx = np.arange(Nx)
+    ny = np.arange(Ny)
+    sx = np.exp(1j * k * dx * nx[:, None] * np.sin(theta) * np.cos(phi))
+    sy = np.exp(1j * k * dy * ny[None, :] * np.sin(theta) * np.sin(phi))
+    return (sx*sy).flatten()
+
+def generate_channel(user_angle, Nx, Ny, dx, dy, NRIS, failure_prob=0.0):
+    h_los = steering_vector_3d(user_angle[0], user_angle[1], Nx, Ny, dx, dy)
+    h_nlos = (np.random.randn(Nx*Ny)+1j*np.random.randn(Nx*Ny))/np.sqrt(2)
+    h_total = 0.7*h_los + 0.3*h_nlos
+    h_total = h_total[:NRIS]
+    failures = np.random.rand(NRIS) < failure_prob
+    h_total[failures] = 0
+    return h_total
+
+# ===============================
+# SCA-based RIS Optimization (simplified)
+# ===============================
+def sca_ris_optimization(H_users, NRIS, iterations=50, lr=0.05):
+    theta_ris = np.random.rand(NRIS)*2*np.pi
+    for _ in range(iterations):
+        grad = np.zeros(NRIS)
+        for i, hi in enumerate(H_users):
+            interference = sum([H_users[j] for j in range(len(H_users)) if j!=i])
+            signal = np.sum(np.exp(1j*theta_ris)*hi)
+            inter_power = np.abs(np.sum(np.exp(1j*theta_ris)*interference))**2
+            grad += -2*np.imag(hi*np.conj(signal)/(1+inter_power))
+        theta_ris -= lr*grad
+        theta_ris = np.mod(theta_ris,2*np.pi)
+    return np.exp(1j*theta_ris)
+
+def calculate_metrics(weights, H_users, SNR_dB):
+    SNR = 10**(SNR_dB/10)
+    rates = []
+    for i, h in enumerate(H_users):
+        interference = sum([np.dot(weights,H_users[j]) for j in range(len(H_users)) if j!=i])
+        signal_power = np.abs(np.dot(weights,h))**2
+        rate = np.log2(1 + SNR*signal_power/(1+SNR*np.abs(interference)**2))
+        rates.append(rate)
+    sum_rate = sum(rates)
+    fairness = (sum_rate**2)/(num_users*sum([r**2 for r in rates])) if sum_rate>0 else 0
+    energy_eff = sum_rate/NRIS
+    return sum_rate, fairness, energy_eff
+
+def compute_beam_AF(weights, theta_scan, phi_scan, Nx, Ny, dx, dy):
+    AF = np.zeros((len(theta_scan), len(phi_scan)))
+    for i, theta in enumerate(theta_scan):
+        for j, phi in enumerate(phi_scan):
+            a = steering_vector_3d(theta, phi, Nx, Ny, dx, dy)
+            AF[i,j] = np.abs(np.dot(weights, a))
+    AF /= np.max(AF)
+    AF_dB = 20*np.log10(AF+1e-6)
+    theta_grid, phi_grid = np.meshgrid(theta_scan, phi_scan, indexing='ij')
+    X = AF*np.sin(np.deg2rad(theta_grid))*np.cos(np.deg2rad(phi_grid))
+    Y = AF*np.sin(np.deg2rad(theta_grid))*np.sin(np.deg2rad(phi_grid))
+    Z = AF*np.cos(np.deg2rad(theta_grid))
+    return X,Y,Z,AF_dB
+
+# ===============================
+# Initialize Dash App
+# ===============================
+app = dash.Dash(__name__)
+app.layout = html.Div([
+    html.H2("6G RIS-Assisted Massive MIMO Dashboard"),
+    
+    html.Div([
+        html.Label("RIS Elements (NRIS)"),
+        dcc.Slider(id='NRIS-slider', min=8, max=128, step=8, value=32, marks={i:str(i) for i in range(8,129,16)}),
+        html.Label("Gradient Descent Iterations"),
+        dcc.Slider(id='iter-slider', min=10, max=200, step=10, value=50, marks={i:str(i) for i in range(10,201,20)}),
+        html.Label("Learning Rate"),
+        dcc.Slider(id='lr-slider', min=0.01, max=0.2, step=0.01, value=0.05),
+        html.Label("RIS Element Failure Probability"),
+        dcc.Slider(id='fail-slider', min=0, max=0.3, step=0.01, value=0.05),
+        html.Label("Time Step (User Mobility)"),
+        dcc.Slider(id='time-slider', min=0, max=time_steps-1, step=1, value=0),
+    ], style={'width':'45%','display':'inline-block','vertical-align':'top'}),
+    
+    dcc.Graph(id='beam-plot', style={'height':'700px'}),
+    dcc.Graph(id='metrics-plot', style={'height':'400px'})
+])
+
+# ===============================
+# Dash Callback
+# ===============================
+@app.callback(
+    [Output('beam-plot','figure'),
+     Output('metrics-plot','figure')],
+    [Input('NRIS-slider','value'),
+     Input('iter-slider','value'),
+     Input('lr-slider','value'),
+     Input('fail-slider','value'),
+     Input('time-slider','value')]
+)
+def update_dashboard(NRIS, iterations, lr, fail_prob, time_step):
+    user_angles_init = [(20,30),(-25,10),(10,-20),(-15,25)]
+    user_trajectories = [[(theta+time_step*0.5,phi+time_step*0.3) for t in range(time_steps)] for theta,phi in user_angles_init]
+    
+    # Generate channels
+    H_users = [generate_channel(user_trajectories[u][time_step], Nx, Ny, dx, dy, NRIS, fail_prob) for u in range(num_users)]
+    
+    # RIS optimization (SCA)
+    ris_phases = sca_ris_optimization(H_users, NRIS, iterations, lr)
+    
+    # Base station beam
+    weights_bs = steering_vector_3d(0,0,Nx,Ny,dx,dy)
+    
+    # RIS-assisted weights
+    weights_ris = weights_bs.copy()
+    for h in H_users:
+        weights_ris += h*np.mean(ris_phases)
+    
+    # Compute performance metrics
+    sum_rate, fairness, energy_eff = calculate_metrics(weights_ris, H_users, SNR_dB)
+    
+    # Beam AF
+    X,Y,Z,AF_dB = compute_beam_AF(weights_ris, theta_scan, phi_scan, Nx, Ny, dx, dy)
+    beam_fig = go.Figure(data=[go.Surface(x=X, y=Y, z=Z, surfacecolor=AF_dB, colorscale='Viridis', cmin=-40, cmax=0)])
+    beam_fig.update_layout(scene=dict(xaxis_title='X', yaxis_title='Y', zaxis_title='Z'),
+                           title=f'Time Step {time_step}')
+    
+    # Metrics figure
+    metrics_fig = go.Figure()
+    metrics_fig.add_trace(go.Bar(x=['Sum-rate','Fairness','Energy Efficiency'], y=[sum_rate,fairness,energy_eff]))
+    metrics_fig.update_layout(title='Performance Metrics')
+    
+    return beam_fig, metrics_fig
+
+# ===============================
+# Run the app
+# ===============================
+if __name__ == '__main__':
+    app.run_server(debug=True)
